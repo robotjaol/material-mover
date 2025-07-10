@@ -1,0 +1,49 @@
+{
+  "historical_data": {
+    "description": "Sample historical pallet movement data for June 2024",
+    "data_points": [
+      {
+        "timestamp": "2024-06-01T08:00:00",
+        "tube_station_1": 15,
+        "tube_station_2": 12,
+        "tube_station_3": 10,
+        "tube_station_4": 8,
+        "non_tube_station_5": 20,
+        "non_tube_station_6": 18,
+        "rms_a": 45,
+        "rms_c": 38
+      },
+      {
+        "timestamp": "2024-06-01T09:00:00",
+        "tube_station_1": 18,
+        "tube_station_2": 14,
+        "tube_station_3": 11,
+        "tube_station_4": 9,
+        "non_tube_station_5": 22,
+        "non_tube_station_6": 19,
+        "rms_a": 48,
+        "rms_c": 40
+      }
+    ],
+    "agv_operational_data": {
+      "tube_agv_1": {
+        "avg_travel_time": 120,
+        "avg_loading_time": 30,
+        "avg_unloading_time": 30,
+        "capacity_per_hour": 15
+      },
+      "tube_agv_2": {
+        "avg_travel_time": 150,
+        "avg_loading_time": 30,
+        "avg_unloading_time": 30,
+        "capacity_per_hour": 12
+      },
+      "non_tube_agv_1": {
+        "avg_travel_time": 180,
+        "avg_loading_time": 30,
+        "avg_unloading_time": 30,
+        "capacity_per_hour": 10
+      }
+    }
+  }
+} 
