@@ -1,53 +1,25 @@
-from fastapi import APIRouter, Response
-from models.schemas import PredictionRequest
-from services.prediction import run_prediction
-from services.delay import estimate_delays
-import io
 import csv
+import io
+
+from fastapi import APIRouter, Response
+
+from api.prediction import create_prediction
+from models.schemas import PredictionRequest
 
 router = APIRouter()
 
+
 @router.post("/export")
 def export_csv(request: PredictionRequest):
-    """Export forecast and delay data as CSV"""
-    # Get prediction data
-    forecast_entries = run_prediction(request)
-    delay_entries = estimate_delays(request)
-    
-    # Create CSV content
-    output = io.StringIO()
-    writer = csv.writer(output)
-    
-    # Write forecast data
-    writer.writerow(['Forecast Data'])
-    writer.writerow(['Hour', 'Route', 'Pallet Volume', 'Threshold', 'Alert'])
-    for entry in forecast_entries:
-        writer.writerow([
-            entry.hour,
-            entry.route,
-            entry.pallet_volume,
-            entry.threshold,
-            'Yes' if entry.alert else 'No'
-        ])
-    
-    writer.writerow([])  # Empty row
-    
-    # Write delay data
-    writer.writerow(['Delay Data'])
-    writer.writerow(['Truck ID', 'Route', 'Delay (minutes)'])
-    for entry in delay_entries:
-        writer.writerow([
-            entry.truck_id,
-            entry.route,
-            entry.delay_minutes
-        ])
-    
-    # Get CSV content
-    csv_content = output.getvalue()
-    output.close()
-    
+    prediction = create_prediction(request)
+    output = io.StringIO(newline="")
+    columns = list(prediction.forecast_table[0].model_fields)
+    writer = csv.DictWriter(output, fieldnames=columns)
+    writer.writeheader()
+    for row in prediction.forecast_table:
+        writer.writerow(row.model_dump())
     return Response(
-        content=csv_content,
+        content=output.getvalue(),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=pallet_forecast.csv"}
-    ) 
+        headers={"Content-Disposition": "attachment; filename=pallet_forecast.csv"},
+    )

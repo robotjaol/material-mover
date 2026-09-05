@@ -1,162 +1,124 @@
-import pandas as pd
+from datetime import datetime, timezone
+from functools import lru_cache
+
 import numpy as np
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from statsmodels.tsa.arima.model import ARIMA
-import xgboost as xgb
-from sklearn.preprocessing import StandardScaler
-from typing import List, Dict, Any
-from models.schemas import PredictionRequest, ForecastEntry
+import pandas as pd
 
-class PredictionEngine:
-    def __init__(self):
-        self.scaler = StandardScaler()
-        self.xgb_model = None
-        self.historical_data = self._load_sample_data()
-    
-    def _load_sample_data(self) -> pd.DataFrame:
-        """Load sample historical data for training"""
-        # Sample data: hourly pallet movements for June
-        dates = pd.date_range('2024-06-01', '2024-06-30', freq='H')
-        np.random.seed(42)
-        
-        data = {
-            'timestamp': dates,
-            'tube_station_1': np.random.poisson(15, len(dates)),
-            'tube_station_2': np.random.poisson(12, len(dates)),
-            'tube_station_3': np.random.poisson(10, len(dates)),
-            'tube_station_4': np.random.poisson(8, len(dates)),
-            'non_tube_station_5': np.random.poisson(20, len(dates)),
-            'non_tube_station_6': np.random.poisson(18, len(dates)),
-            'rms_a': np.random.poisson(45, len(dates)),
-            'rms_c': np.random.poisson(38, len(dates))
-        }
-        return pd.DataFrame(data)
-    
-    def _prepare_features(self, request: PredictionRequest) -> pd.DataFrame:
-        """Prepare features for ML model"""
-        features = []
-        
-        # Extract truck and pallet information
-        total_pallets = sum(truck.pallet_volume for truck in request.trucks)
-        num_trucks = len(request.trucks)
-        
-        # AGV configuration features
-        agv_mode = request.agv_config.mode
-        agv_per_hour = request.agv_config.per_hour
-        
-        # Create feature matrix for each hour
-        for hour in range(12):
-            hour_features = {
-                'hour': hour,
-                'total_pallets': total_pallets,
-                'num_trucks': num_trucks,
-                'agv_mode_single': 1 if agv_mode == 'single' else 0,
-                'agv_mode_dual': 1 if agv_mode == 'dual' else 0,
-                'agv_mode_specialized': 1 if agv_mode == 'specialized' else 0,
-                'agv_capacity_tube': agv_per_hour.get('tube', 4) * 60,  # 4 AGVs * 60 min
-                'agv_capacity_non_tube': agv_per_hour.get('non_tube', 3) * 60,  # 3 AGVs * 60 min
+from models.schemas import ROUTES, PredictionRequest, PredictionResponse
+from services.data import load_history
+from services.delay import capacities, queue_series, route_material
+from services.evaluation import HOLDOUT_HOURS, evaluate_route
+from services.forecasting import forecast_ensemble
+
+
+def scheduled_demand(request, route, start):
+    demand = np.zeros(request.horizon)
+    matching_routes = [name for name in ROUTES if route_material(name) == route_material(route)]
+    for truck in request.trucks:
+        if truck.material != route_material(route):
+            continue
+        hour, minute = map(int, truck.arrival_time.split(":"))
+        arrival = start.normalize() + pd.Timedelta(hours=hour, minutes=minute)
+        if arrival < start:
+            arrival += pd.Timedelta(days=1)
+        offset = int((arrival - start).total_seconds() // 3600)
+        if offset < request.horizon:
+            demand[offset] += truck.pallet_volume / len(matching_routes)
+    return demand
+
+
+def run_prediction(request: PredictionRequest) -> PredictionResponse:
+    history, measured_delays, source = load_history(request)
+    start = history.index[-1] + pd.Timedelta(hours=1)
+    route_capacities = capacities(request)
+    thresholds = {item.station: item.per_hour for item in request.thresholds}
+    forecast_rows = []
+    delay_rows = []
+    evaluation = {}
+    model_status = {}
+    alerts = []
+
+    for route in ROUTES:
+        series = history[route]
+        baseline, status = forecast_ensemble(series, request.horizon)
+        validation, validation_status = forecast_ensemble(series.iloc[:-HOLDOUT_HOURS], HOLDOUT_HOURS)
+        actual = series.iloc[-HOLDOUT_HOURS:]
+        observed = np.full(HOLDOUT_HOURS, np.nan)
+        if measured_delays is not None:
+            observed = measured_delays[route].iloc[-HOLDOUT_HOURS:].to_numpy()
+
+        limits = thresholds.get(route, [20.0] * request.horizon)
+        capacity = route_capacities[route]
+        evaluation[route] = evaluate_route(
+            actual, validation, observed, capacity, limits, request.delay_threshold_minutes
+        )
+        model_status[route] = {"forecast": status, "validation": validation_status}
+
+        scheduled = scheduled_demand(request, route, start)
+        # Truck manifests add demand beyond the historical baseline.
+        demand = np.round(baseline + scheduled, 4)
+        queues = queue_series(demand, capacity)
+        route_has_breach = False
+        route_has_bottleneck = False
+        for hour, queue in enumerate(queues):
+            breach = bool(demand[hour] > limits[hour])
+            bottleneck = queue["delay_minutes"] > request.delay_threshold_minutes
+            delay_row = {
+                "hour": hour,
+                "timestamp": (start + pd.Timedelta(hours=hour)).isoformat(),
+                "route": route,
+                **queue,
+                "bottleneck": bottleneck,
             }
-            features.append(hour_features)
-        
-        return pd.DataFrame(features)
-    
-    def _statistical_forecast(self, data: pd.Series, periods: int = 12) -> List[float]:
-        """Holt-Winters forecasting for time series data"""
-        try:
-            # Fit Holt-Winters model
-            model = ExponentialSmoothing(
-                data, 
-                trend='add', 
-                seasonal='add', 
-                seasonal_periods=24  # Daily seasonality
-            ).fit()
-            
-            # Forecast next 12 hours
-            forecast = model.forecast(periods)
-            return forecast.tolist()
-        except:
-            # Fallback to simple moving average
-            return [data.mean()] * periods
-    
-    def _ml_forecast(self, features: pd.DataFrame) -> Dict[str, List[float]]:
-        """XGBoost-based forecasting"""
-        if self.xgb_model is None:
-            # Train model on historical data (simplified)
-            self._train_model()
-        
-        # Predict for each route
-        predictions = {}
-        routes = ['tube_station_1', 'tube_station_2', 'tube_station_3', 'tube_station_4',
-                 'non_tube_station_5', 'non_tube_station_6', 'rms_a', 'rms_c']
-        
-        for route in routes:
-            # Simplified prediction based on features
-            base_volume = features['total_pallets'].iloc[0] / len(routes)
-            predictions[route] = [base_volume * (1 + 0.1 * hour) for hour in range(12)]
-        
-        return predictions
-    
-    def _train_model(self):
-        """Train XGBoost model on historical data"""
-        # Simplified training - in real implementation, would use actual historical data
-        self.xgb_model = xgb.XGBRegressor(n_estimators=100, random_state=42)
-        # Training would happen here with real data
-    
-    def run_prediction(self, request: PredictionRequest) -> List[ForecastEntry]:
-        """Main prediction method"""
-        # Prepare features
-        features = self._prepare_features(request)
-        
-        # Get statistical forecasts
-        statistical_forecasts = {}
-        for column in ['tube_station_1', 'tube_station_2', 'tube_station_3', 'tube_station_4',
-                      'non_tube_station_5', 'non_tube_station_6', 'rms_a', 'rms_c']:
-            if column in self.historical_data.columns:
-                statistical_forecasts[column] = self._statistical_forecast(
-                    self.historical_data[column]
-                )
-        
-        # Get ML forecasts
-        ml_forecasts = self._ml_forecast(features)
-        
-        # Combine forecasts (simple average)
-        combined_forecasts = {}
-        for route in statistical_forecasts.keys():
-            stat_forecast = statistical_forecasts[route]
-            ml_forecast = ml_forecasts.get(route, [0] * 12)
-            
-            combined = []
-            for i in range(12):
-                combined.append((stat_forecast[i] + ml_forecast[i]) / 2)
-            combined_forecasts[route] = combined
-        
-        # Convert to ForecastEntry format
-        forecast_entries = []
-        for hour in range(12):
-            for route, values in combined_forecasts.items():
-                threshold = self._get_threshold(request, route, hour)
-                alert = values[hour] < threshold
-                
-                forecast_entries.append(ForecastEntry(
-                    hour=hour,
-                    route=route,
-                    pallet_volume=int(values[hour]),
-                    threshold=threshold,
-                    alert=alert
-                ))
-        
-        return forecast_entries
-    
-    def _get_threshold(self, request: PredictionRequest, route: str, hour: int) -> int:
-        """Get threshold for specific route and hour"""
-        for threshold_config in request.thresholds:
-            if threshold_config.station == route and hour < len(threshold_config.per_hour):
-                return threshold_config.per_hour[hour]
-        return 10  # Default threshold
+            delay_rows.append(delay_row)
+            forecast_rows.append({
+                **delay_row,
+                "pallet_volume": float(demand[hour]),
+                "baseline_pallets": round(float(baseline[hour]), 4),
+                "scheduled_pallets": round(float(scheduled[hour]), 4),
+                "threshold": limits[hour],
+                "alert": breach,
+                "capacity_per_hour": round(capacity, 4),
+            })
+            route_has_breach |= breach
+            route_has_bottleneck |= bottleneck
 
-# Global prediction engine instance
-prediction_engine = PredictionEngine()
+        if route_has_breach:
+            alerts.append(f"{route}: demand exceeds the pallet threshold")
+        if route_has_bottleneck:
+            alerts.append(f"{route}: queue delay exceeds {request.delay_threshold_minutes:g} minutes")
 
-def run_prediction(request: PredictionRequest) -> List[ForecastEntry]:
-    """Main prediction function"""
-    return prediction_engine.run_prediction(request) 
+    return PredictionResponse(
+        forecast_table=forecast_rows,
+        delay_summary=delay_rows,
+        alerts=alerts,
+        evaluation=evaluation,
+        model_status=model_status,
+        metadata={
+            "data_source": source,
+            "history_hours": len(history),
+            "holdout_hours": HOLDOUT_HOURS,
+            "forecast_start": start.isoformat(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "queue_initial_backlog": 0,
+            "ensemble": "equal weight across available models",
+            "threshold_evaluation": "configured horizon repeated over holdout",
+        },
+    )
+
+
+@lru_cache(maxsize=8)
+def cached_prediction(payload: str) -> PredictionResponse:
+    return run_prediction(PredictionRequest.model_validate_json(payload))
+
+
+def predict(request: PredictionRequest) -> PredictionResponse:
+    if request.forecast_start is None:
+        if request.history:
+            latest = max(pd.Timestamp(row.timestamp).tz_localize("UTC") if row.timestamp.tzinfo is None
+                         else pd.Timestamp(row.timestamp).tz_convert("UTC") for row in request.history)
+            start = latest.floor("h") + pd.Timedelta(hours=1)
+        else:
+            start = pd.Timestamp.now(tz="UTC").floor("h")
+        request = request.model_copy(update={"forecast_start": start.to_pydatetime()})
+    return cached_prediction(request.model_dump_json())

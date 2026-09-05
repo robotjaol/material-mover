@@ -1,9 +1,7 @@
-fastapi
-uvicorn
-pandas
-numpy
-statsmodels
-scikit-learn
-xgboost
-redis
-python-multipart 
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+pandas>=2.2,<3
+numpy>=2,<3
+statsmodels==0.14.6
+scikit-learn>=1.6,<2
+xgboost>=3,<4
